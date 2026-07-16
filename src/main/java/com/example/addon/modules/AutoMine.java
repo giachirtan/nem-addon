@@ -6,34 +6,29 @@ import meteordevelopment.meteorclient.settings.*;
 import meteordevelopment.meteorclient.systems.modules.Module;
 import meteordevelopment.meteorclient.utils.player.ChatUtils;
 import meteordevelopment.meteorclient.utils.player.InvUtils;
-import meteordevelopment.meteorclient.utils.player.FindItemResult;
 import meteordevelopment.orbit.EventHandler;
-import net.minecraft.block.ShulkerBoxBlock;
 import net.minecraft.block.BlockState;
-import net.minecraft.client.gui.screen.ingame.GenericContainerScreen;
-import net.minecraft.component.DataComponentTypes;
-import net.minecraft.component.type.ItemEnchantmentsComponent;
+import net.minecraft.block.ShulkerBoxBlock;
 import net.minecraft.enchantment.Enchantment;
 import net.minecraft.enchantment.EnchantmentHelper;
-import net.minecraft.registry.entry.RegistryEntry;
 import net.minecraft.item.*;
 import net.minecraft.network.packet.c2s.play.PlayerMoveC2SPacket;
-import net.minecraft.util.math.Vec3d;
-import java.util.Set;
 import net.minecraft.registry.Registries;
-import net.minecraft.registry.RegistryKeys;
-import net.minecraft.screen.GenericContainerScreenHandler;
+import net.minecraft.registry.entry.RegistryEntry;
 import net.minecraft.screen.slot.SlotActionType;
+import net.minecraft.text.Text;
 import net.minecraft.util.Hand;
 import net.minecraft.util.hit.BlockHitResult;
 import net.minecraft.util.math.*;
 
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Set;
 
 /**
- * AutoMine+ — Tự động hóa chu kỳ: đào → bán rác → chia kho → lưu Shulker/Ender Chest → lặp lại.
- * Dùng Baritone (#mine, #stop) để di chuyển và đào.
+ * AutoMine+ v2 — Tự động hóa chu kỳ: đào → bán rác → chia kho → lưu Shulker/Ender Chest → lặp lại.
+ * Nâng cấp: watchdog chống kẹt, bảo vệ HP & độ bền cúp, đập shulker chính xác,
+ * chống loop shop/GUI vô hạn, thống kê tốc độ.
  */
 public class AutoMine extends Module {
 
@@ -42,27 +37,26 @@ public class AutoMine extends Module {
     // =========================================================
     private final SettingGroup sgGeneral = settings.getDefaultGroup();
     private final SettingGroup sgShop    = settings.createGroup("Shop Settings");
+    private final SettingGroup sgExp     = settings.createGroup("Auto Mending (EXP)");
     private final SettingGroup sgTrash   = settings.createGroup("Trash Items");
+    private final SettingGroup sgSafety  = settings.createGroup("Safety");
 
     // ── General ──────────────────────────────────────────────
     private final Setting<Item> mineBlock = sgGeneral.add(new ItemSetting.Builder()
         .name("mine-block")
-        .description("Khối quặng cho Baritone #mine (luôn là ore block: DIAMOND_ORE, IRON_ORE...)"
-            + " — dùng để đào, không phải để đếm.")
+        .description("Khối quặng cho Baritone #mine (DIAMOND_ORE, IRON_ORE...).")
         .defaultValue(Items.DIAMOND_ORE)
         .build());
 
     private final Setting<Boolean> autoDetectDrop = sgGeneral.add(new BoolSetting.Builder()
         .name("auto-detect-drop")
-        .description("Tự động nhận biết: có Silk Touch trong hotbar → đếm khối ore;"
-            + " không có Silk Touch → đếm item rơi ra (DIAMOND, RAW_IRON...).")
+        .description("Có Silk Touch trong hotbar → đếm khối ore; không có → đếm item rơi ra.")
         .defaultValue(true)
         .build());
 
     private final Setting<Item> collectItem = sgGeneral.add(new ItemSetting.Builder()
         .name("collect-item")
-        .description("Item cần đếm/cất khi tắt auto-detect."
-            + " Ví dụ: DIAMOND nếu Fortune, DIAMOND_ORE nếu Silk Touch.")
+        .description("Item cần đếm/cất khi tắt auto-detect.")
         .defaultValue(Items.DIAMOND)
         .visible(() -> !autoDetectDrop.get())
         .build());
@@ -75,7 +69,7 @@ public class AutoMine extends Module {
 
     private final Setting<Integer> keepAmount = sgGeneral.add(new IntSetting.Builder()
         .name("keep-amount")
-        .description("Số item giữ lại trong người sau khi cất vào Shulker (27–64 để tiếp tục chia kho).")
+        .description("Số item giữ lại trong người sau khi cất vào Shulker (27–64).")
         .defaultValue(27).min(27).sliderMax(64)
         .build());
 
@@ -85,71 +79,47 @@ public class AutoMine extends Module {
         .defaultValue(5).min(1).sliderMax(20)
         .build());
 
-    // Ender Chest không cần nhặt lại — mua mới mỗi chu kỳ qua /shop.
-
     // ── Shop Settings ─────────────────────────────────────────
     private final Setting<Integer> shopCategorySlot = sgShop.add(new IntSetting.Builder()
-        .name("shop-category-slot")
-        .description("Slot danh mục Ender Chest trong /shop (0-indexed).")
-        .defaultValue(11).min(0).sliderMax(53)
-        .build());
+        .name("shop-category-slot").description("Slot danh mục Ender Chest trong /shop (0-indexed).")
+        .defaultValue(11).min(0).sliderMax(53).build());
 
     private final Setting<Integer> shopEnderChestSlot = sgShop.add(new IntSetting.Builder()
-        .name("shop-enderchest-slot")
-        .description("Slot item Ender Chest trong shop (0-indexed).")
-        .defaultValue(9).min(0).sliderMax(53)
-        .build());
+        .name("shop-enderchest-slot").description("Slot item Ender Chest trong shop.")
+        .defaultValue(9).min(0).sliderMax(53).build());
 
     private final Setting<Integer> shopShulkerSlot = sgShop.add(new IntSetting.Builder()
-        .name("shop-shulker-slot")
-        .description("Slot item Shulker Box trong shop (0-indexed).")
-        .defaultValue(17).min(0).sliderMax(53)
-        .build());
+        .name("shop-shulker-slot").description("Slot item Shulker Box trong shop.")
+        .defaultValue(17).min(0).sliderMax(53).build());
 
     private final Setting<Integer> shopConfirmSlot = sgShop.add(new IntSetting.Builder()
-        .name("shop-confirm-slot")
-        .description("Slot xác nhận mua trong shop (0-indexed).")
-        .defaultValue(23).min(0).sliderMax(53)
-        .build());
+        .name("shop-confirm-slot").description("Slot xác nhận mua trong shop.")
+        .defaultValue(23).min(0).sliderMax(53).build());
 
     private final Setting<Integer> shopBackSlot = sgShop.add(new IntSetting.Builder()
-        .name("shop-back-slot")
-        .description("Slot quay lại trang trước trong shop (0-indexed).")
-        .defaultValue(21).min(0).sliderMax(53)
-        .build());
+        .name("shop-back-slot").description("Slot quay lại trang trước trong shop.")
+        .defaultValue(21).min(0).sliderMax(53).build());
 
-    // ── Auto EXP Settings ─────────────────────────────────────
-    private final SettingGroup sgExp = settings.createGroup("Auto Mending (EXP)");
-
+    // ── Auto EXP ──────────────────────────────────────────────
     private final Setting<Boolean> autoExpBuy = sgExp.add(new BoolSetting.Builder()
-        .name("auto-buy-exp")
-        .description("Tự động check và mua 2 stack EXP vào slot 6 và 7.")
-        .defaultValue(true)
-        .build());
+        .name("auto-buy-exp").description("Tự động check và mua 2 stack EXP.")
+        .defaultValue(true).build());
 
     private final Setting<Integer> xpSlot1 = sgExp.add(new IntSetting.Builder()
-        .name("xp-slot-1")
-        .description("Slot hotbar chứa EXP stack 1 (mặc định 6 tức là index 5).")
-        .defaultValue(5).min(0).sliderMax(8)
-        .build());
+        .name("xp-slot-1").description("Slot hotbar chứa EXP stack 1 (index).")
+        .defaultValue(5).min(0).sliderMax(8).build());
 
     private final Setting<Integer> xpSlot2 = sgExp.add(new IntSetting.Builder()
-        .name("xp-slot-2")
-        .description("Slot hotbar chứa EXP stack 2 (mặc định 7 tức là index 6).")
-        .defaultValue(6).min(0).sliderMax(8)
-        .build());
+        .name("xp-slot-2").description("Slot hotbar chứa EXP stack 2 (index).")
+        .defaultValue(6).min(0).sliderMax(8).build());
 
     private final Setting<Integer> shopExpCategorySlot = sgExp.add(new IntSetting.Builder()
-        .name("shop-exp-category-slot")
-        .description("Slot danh mục bán EXP trong /shop.")
-        .defaultValue(13).min(0).sliderMax(53)
-        .build());
+        .name("shop-exp-category-slot").description("Slot danh mục bán EXP trong /shop.")
+        .defaultValue(13).min(0).sliderMax(53).build());
 
     private final Setting<Integer> shopExpItemSlot = sgExp.add(new IntSetting.Builder()
-        .name("shop-exp-item-slot")
-        .description("Slot bình EXP trong danh mục.")
-        .defaultValue(16).min(0).sliderMax(53)
-        .build());
+        .name("shop-exp-item-slot").description("Slot bình EXP trong danh mục.")
+        .defaultValue(16).min(0).sliderMax(53).build());
 
     // ── Trash Items ───────────────────────────────────────────
     private final Setting<List<Item>> trashItems = sgTrash.add(new ItemListSetting.Builder()
@@ -164,6 +134,37 @@ public class AutoMine extends Module {
             Items.BLAZE_ROD, Items.ENDER_PEARL
         )
         .build());
+
+    // ── Safety ────────────────────────────────────────────────
+    private final Setting<Integer> minHealth = sgSafety.add(new IntSetting.Builder()
+        .name("min-health")
+        .description("HP tối thiểu (nửa tim). Dưới mức này module dừng khẩn cấp.")
+        .defaultValue(10).min(0).sliderMax(20).build());
+
+    private final Setting<Boolean> autoDisconnect = sgSafety.add(new BoolSetting.Builder()
+        .name("auto-disconnect")
+        .description("Thoát server khi HP thấp thay vì chỉ dừng module.")
+        .defaultValue(false).build());
+
+    private final Setting<Integer> toolMinDurability = sgSafety.add(new IntSetting.Builder()
+        .name("tool-min-durability")
+        .description("Độ bền tối thiểu (%) của cúp. Dưới mức này mà hết EXP → dừng để không vỡ đồ.")
+        .defaultValue(10).min(1).sliderMax(50).build());
+
+    private final Setting<Integer> stuckTimeout = sgSafety.add(new IntSetting.Builder()
+        .name("stuck-timeout")
+        .description("Số tick tối đa được kẹt ở 1 bước trước khi watchdog tự phục hồi.")
+        .defaultValue(400).min(100).sliderMax(1200).build());
+
+    private final Setting<Integer> maxRetries = sgSafety.add(new IntSetting.Builder()
+        .name("max-retries")
+        .description("Số lần tự phục hồi tối đa trong 1 chu kỳ trước khi tắt module.")
+        .defaultValue(3).min(1).sliderMax(10).build());
+
+    private final Setting<Boolean> notify = sgSafety.add(new BoolSetting.Builder()
+        .name("chat-info")
+        .description("Hiện thông báo trạng thái trong chat.")
+        .defaultValue(true).build());
 
     // =========================================================
     //  State Machine
@@ -217,27 +218,60 @@ public class AutoMine extends Module {
 
     private State currentState = State.IDLE;
     private int   timer        = 0;
-    private int          distSubState   = 0;
-    private int          distSourceSlot = -1;
-    private List<Integer> distTargetSlots = new ArrayList<>();
-    private int          distTargetIdx  = 0;
-    private boolean      hasDistributed = false;
+
+    // Distribute
+    private int distSubState   = 0;
+    private int distSourceSlot = -1;
+    private final List<Integer> distTargetSlots = new ArrayList<>();
+    private int distTargetIdx  = 0;
+
+    // Vị trí đặt block
     private BlockPos placedShulkerPos = null;
     private BlockPos placedEnderPos   = null;
+    private final Set<BlockPos> blacklistedSpots = new java.util.HashSet<>();
+
+    // Repair / pickup
     private int lastXpCount = 0;
     private int repairWaitTicks = 0;
     private int shulkerPickupTimeout = 0;
-    private final Set<BlockPos> blacklistedSpots = new java.util.HashSet<>();
+
+    // ── Watchdog & thống kê ──
+    private State lastState = State.IDLE;
+    private int   ticksInState = 0;
+    private int   retries = 0;
+    private int   guiRetries = 0;
+    private int   expBuyAttempts = 0;
+    private int   lastXpBuyCount = -1;
+    private Vec3d lastMinePos = Vec3d.ZERO;
+    private int   miningIdleTicks = 0;
+    private int   lastTargetCount = 0;
+    private int   cyclesDone = 0;
+    private int   totalStored = 0;
+    private long  sessionStart = 0;
 
     public AutoMine() {
-        super(AddonTemplate.CATEGORY, "AutoMine+", "Tự động hóa đào, sửa, bán, cất kho.");
+        super(AddonTemplate.CATEGORY, "AutoMine+", "Tự động hóa đào, sửa, bán, cất kho (v2 — watchdog & safety).");
     }
 
     @Override
     public void onActivate() {
         currentState = State.IDLE;
+        lastState = State.IDLE;
         timer = 0;
+        ticksInState = 0;
+        retries = 0;
+        guiRetries = 0;
+        expBuyAttempts = 0;
+        lastXpBuyCount = -1;
+        miningIdleTicks = 0;
+        lastTargetCount = 0;
+        cyclesDone = 0;
+        totalStored = 0;
+        sessionStart = System.currentTimeMillis();
+        placedShulkerPos = null;
+        placedEnderPos = null;
         blacklistedSpots.clear();
+        info("Bắt đầu phiên đào mới.");
     }
 
     @Override
@@ -245,9 +279,33 @@ public class AutoMine extends Module {
         if (mc.options != null && mc.options.attackKey != null) mc.options.attackKey.setPressed(false);
     }
 
+    @Override
+    public String getInfoString() {
+        if (mc.player == null) return null;
+        return currentState + " " + countTargetItems() + "/" + collectAmount.get();
+    }
+
     @EventHandler
     private void onTick(TickEvent.Pre event) {
         if (mc.player == null || mc.world == null) return;
+
+        // ── Safety: HP nguy hiểm → dừng khẩn cấp ──
+        if (mc.player.getHealth() <= minHealth.get()) {
+            panic();
+            return;
+        }
+
+        // ── Watchdog: đo thời gian kẹt ở mỗi state ──
+        if (currentState != lastState) {
+            lastState = currentState;
+            ticksInState = 0;
+        } else ticksInState++;
+
+        if (isWatchdogState(currentState) && ticksInState > stuckTimeout.get()) {
+            recover(currentState.name());
+            return;
+        }
+
         if (timer > 0) { timer--; return; }
 
         switch (currentState) {
@@ -281,7 +339,8 @@ public class AutoMine extends Module {
                 boolean threwExpTrash = false;
                 for (int hIdx : new int[]{xpSlot1.get(), xpSlot2.get()}) {
                     int handlerSlot = cszExp + 27 + hIdx;
-                    if (handlerSlot < sellExpH.slots.size() && sellExpH.getSlot(handlerSlot).hasStack() && sellExpH.getSlot(handlerSlot).getStack().getItem() != Items.EXPERIENCE_BOTTLE) {
+                    if (handlerSlot < sellExpH.slots.size() && sellExpH.getSlot(handlerSlot).hasStack()
+                        && sellExpH.getSlot(handlerSlot).getStack().getItem() != Items.EXPERIENCE_BOTTLE) {
                         mc.interactionManager.clickSlot(sellExpH.syncId, handlerSlot, 0, SlotActionType.QUICK_MOVE, mc.player);
                         timer = actionDelay.get();
                         threwExpTrash = true;
@@ -313,34 +372,76 @@ public class AutoMine extends Module {
                 if (!assertContainerOpen(State.OPEN_SHOP_EXP)) break;
                 clickContainerSlot(shopExpItemSlot.get());
                 timer = actionDelay.get() * 4;
+                expBuyAttempts = 0;
+                lastXpBuyCount = -1;
                 currentState = State.SHOP_EXP_BUY;
                 break;
 
             case SHOP_EXP_BUY:
                 if (!assertContainerOpen(State.OPEN_SHOP_EXP)) break;
-                if (countXpBottles() < 128) {
-                    clickContainerSlot(shopConfirmSlot.get());
-                    timer = actionDelay.get() * 3;
-                } else {
+                int xpNow = countXpBottles();
+                if (xpNow >= 128) {
                     mc.player.closeHandledScreen();
                     timer = 15;
                     currentState = State.START_MINE;
+                    break;
                 }
+                // Chống loop vô hạn: bấm mua mà số EXP không tăng → hết tiền hoặc sai slot
+                if (lastXpBuyCount >= 0 && xpNow <= lastXpBuyCount) {
+                    if (++expBuyAttempts > 8) {
+                        warn("Không mua thêm được EXP (hết tiền hoặc sai slot?) → tiếp tục đào với " + xpNow + " bình.");
+                        expBuyAttempts = 0;
+                        mc.player.closeHandledScreen();
+                        timer = 15;
+                        currentState = State.START_MINE;
+                        break;
+                    }
+                } else expBuyAttempts = 0;
+                lastXpBuyCount = xpNow;
+                clickContainerSlot(shopConfirmSlot.get());
+                timer = actionDelay.get() * 3;
                 break;
 
             case START_MINE:
                 if (mc.currentScreen != null) mc.player.closeHandledScreen();
                 ChatUtils.sendPlayerMsg("#mine " + Registries.ITEM.getId(mineBlock.get()).toString());
                 timer = 60;
+                miningIdleTicks = 0;
+                lastMinePos = mc.player.getPos();
+                lastTargetCount = countTargetItems();
                 currentState = State.MINING;
                 break;
 
             case MINING:
+                // ── Bảo vệ độ bền cúp ──
+                if (!hasUsablePickaxe()) {
+                    ChatUtils.sendPlayerMsg("#stop");
+                    warn("Cúp sắp vỡ mà hết EXP mending → dừng để bảo vệ đồ nghề.");
+                    toggle();
+                    return;
+                }
+
+                // ── Anti-stuck: Baritone tự dừng / không tìm thấy ore ──
+                int nowCount = countTargetItems();
+                if (nowCount > lastTargetCount || mc.player.getPos().squaredDistanceTo(lastMinePos) > 0.25) {
+                    miningIdleTicks = 0;
+                    lastMinePos = mc.player.getPos();
+                } else if (++miningIdleTicks > stuckTimeout.get()) {
+                    miningIdleTicks = 0;
+                    info("Baritone đứng yên quá lâu → gửi lại lệnh #mine.");
+                    currentState = State.START_MINE;
+                    break;
+                }
+                lastTargetCount = nowCount;
+
+                // ── Điều kiện dừng đào ──
                 if (!isDistributedProperly()) {
-                    if (countTargetItems() >= collectAmount.get()) currentState = State.STOP_MINE;
+                    if (nowCount >= collectAmount.get()) currentState = State.STOP_MINE;
                 } else {
                     if (isMainInventoryFull()) currentState = State.STOP_MINE;
                 }
+
+                // ── Phát hiện đang mending (ném EXP) ──
                 int currentXp = countXpBottles();
                 if (currentXp < lastXpCount || mc.player.getMainHandStack().getItem() == Items.EXPERIENCE_BOTTLE) {
                     ChatUtils.sendPlayerMsg("#stop");
@@ -354,7 +455,8 @@ public class AutoMine extends Module {
                 int curXp = countXpBottles();
                 if (curXp >= lastXpCount) repairWaitTicks++;
                 lastXpCount = curXp;
-                if (repairWaitTicks >= 100 || curXp == 0) currentState = State.START_MINE;
+                // Sửa xong (hoặc hết EXP) → quay về CHECK_EXP để mua bù trước khi đào tiếp
+                if (repairWaitTicks >= 100 || curXp == 0) currentState = State.CHECK_EXP;
                 break;
 
             case STOP_MINE:
@@ -518,9 +620,14 @@ public class AutoMine extends Module {
 
             case PLACE_SHULKER:
                 if (placedShulkerPos == null) { currentState = State.FIND_SHULKER_PLACE; break; }
-                meteordevelopment.meteorclient.utils.player.FindItemResult shulker = meteordevelopment.meteorclient.utils.player.InvUtils.findInHotbar(s -> isShulkerItem(s));
-                if (!shulker.found()) { toggle(); return; }
-                meteordevelopment.meteorclient.utils.player.InvUtils.swap(shulker.slot(), false);
+                meteordevelopment.meteorclient.utils.player.FindItemResult shulker =
+                    InvUtils.findInHotbar(this::isShulkerItem);
+                if (!shulker.found()) {
+                    warn("Không tìm thấy Shulker trong hotbar → quay lại mua.");
+                    currentState = State.OPEN_SHOP;
+                    break;
+                }
+                InvUtils.swap(shulker.slot(), false);
                 rotateAndPlace(placedShulkerPos);
                 timer = 15;
                 currentState = State.OPEN_SHULKER;
@@ -548,19 +655,31 @@ public class AutoMine extends Module {
                 break;
 
             case BREAK_SHULKER:
-                ChatUtils.sendPlayerMsg("#mine minecraft:shulker_box");
-                shulkerPickupTimeout = 200;
-                currentState = State.WAIT_SHULKER_PICKUP;
+                // Đập CHÍNH XÁC block đã đặt — không dùng #mine shulker_box
+                // (tránh Baritone đi phá shulker khác trong map build!)
+                if (placedShulkerPos == null) { currentState = State.FIND_ENDER_PLACE; break; }
+                if (!isShulkerBlock(placedShulkerPos)) {
+                    // Đã vỡ → đi tới vị trí đó nhặt item
+                    ChatUtils.sendPlayerMsg("#goto " + placedShulkerPos.getX() + " " + placedShulkerPos.getY() + " " + placedShulkerPos.getZ());
+                    shulkerPickupTimeout = 200;
+                    currentState = State.WAIT_SHULKER_PICKUP;
+                    break;
+                }
+                facePos(Vec3d.ofCenter(placedShulkerPos));
+                mc.interactionManager.updateBlockBreakingProgress(placedShulkerPos, Direction.UP);
+                mc.player.swingHand(Hand.MAIN_HAND);
                 break;
 
             case WAIT_SHULKER_PICKUP:
                 if (hasShulkerInInventory()) {
                     ChatUtils.sendPlayerMsg("#stop");
+                    placedShulkerPos = null;
                     currentState = State.FIND_ENDER_PLACE;
                 } else if (--shulkerPickupTimeout <= 0) currentState = State.RETRY_SHULKER_PICKUP;
                 break;
 
             case RETRY_SHULKER_PICKUP:
+                // Inventory có thể đầy → bán rác để có chỗ nhặt shulker
                 if (mc.currentScreen != null) mc.player.closeHandledScreen();
                 ChatUtils.sendPlayerMsg("/sell");
                 timer = 40;
@@ -589,9 +708,14 @@ public class AutoMine extends Module {
 
             case PLACE_ENDER:
                 if (placedEnderPos == null) { currentState = State.FIND_ENDER_PLACE; break; }
-                meteordevelopment.meteorclient.utils.player.FindItemResult ender = meteordevelopment.meteorclient.utils.player.InvUtils.findInHotbar(s -> s.getItem() == Items.ENDER_CHEST);
-                if (!ender.found()) { toggle(); return; }
-                meteordevelopment.meteorclient.utils.player.InvUtils.swap(ender.slot(), false);
+                meteordevelopment.meteorclient.utils.player.FindItemResult ender =
+                    InvUtils.findInHotbar(s -> s.getItem() == Items.ENDER_CHEST);
+                if (!ender.found()) {
+                    warn("Không tìm thấy Ender Chest trong hotbar → quay lại mua.");
+                    currentState = State.OPEN_SHOP;
+                    break;
+                }
+                InvUtils.swap(ender.slot(), false);
                 rotateAndPlace(placedEnderPos);
                 timer = 25;
                 currentState = State.OPEN_ENDER;
@@ -631,13 +755,91 @@ public class AutoMine extends Module {
 
             case RESTART_CYCLE:
                 blacklistedSpots.clear();
+                placedShulkerPos = null;
+                placedEnderPos = null;
+                retries = 0;
+                guiRetries = 0;
+                cyclesDone++;
+                long mins = Math.max(1, (System.currentTimeMillis() - sessionStart) / 60000);
+                info("Hoàn tất chu kỳ #" + cyclesDone + " — đã cất " + totalStored
+                    + " item (~" + (totalStored * 60L / mins) + " item/giờ).");
                 currentState = State.DISTRIBUTE_ITEMS;
                 break;
         }
     }
 
+    // =========================================================
+    //  Watchdog & Safety
+    // =========================================================
+
+    /** Các state được phép chờ vô hạn (có cơ chế timeout riêng) thì miễn watchdog. */
+    private boolean isWatchdogState(State s) {
+        return switch (s) {
+            case IDLE, MINING, WAIT_REPAIR, WAIT_SHULKER_PICKUP -> false;
+            default -> true;
+        };
+    }
+
+    /** Phục hồi khi kẹt: đóng GUI, dừng Baritone, quay về checkpoint hợp lý. */
+    private void recover(String where) {
+        retries++;
+        if (mc.currentScreen != null) mc.player.closeHandledScreen();
+        ChatUtils.sendPlayerMsg("#stop");
+
+        if (retries > maxRetries.get()) {
+            warn("Kẹt quá " + maxRetries.get() + " lần tại " + where + " → tắt module để an toàn.");
+            toggle();
+            return;
+        }
+
+        info("Watchdog: kẹt tại " + where + " → tự phục hồi (" + retries + "/" + maxRetries.get() + ").");
+        timer = 40;
+        ticksInState = 0;
+        lastState = State.IDLE;
+        distSubState = 0;
+
+        // Checkpoint thông minh: không bỏ rơi shulker/ender đã đặt giữa đường
+        if (placedShulkerPos != null && isShulkerBlock(placedShulkerPos)) currentState = State.OPEN_SHULKER;
+        else if (placedShulkerPos != null) currentState = State.BREAK_SHULKER;
+        else if (placedEnderPos != null && mc.world.getBlockState(placedEnderPos).getBlock() == net.minecraft.block.Blocks.ENDER_CHEST)
+            currentState = State.OPEN_ENDER;
+        else currentState = State.CHECK_EXP;
+    }
+
+    /** Dừng khẩn cấp khi HP thấp. */
+    private void panic() {
+        ChatUtils.sendPlayerMsg("#stop");
+        if (mc.currentScreen != null) mc.player.closeHandledScreen();
+        warn("HP nguy hiểm (" + (int) mc.player.getHealth() + "/20) → dừng khẩn cấp!");
+        if (autoDisconnect.get() && mc.player.networkHandler != null) {
+            mc.player.networkHandler.getConnection().disconnect(Text.literal("[AutoMine+] HP thấp — thoát an toàn."));
+        }
+        toggle();
+    }
+
+    /** Còn cúp dùng được không: hoặc còn EXP mending, hoặc có cúp trên ngưỡng độ bền. */
+    private boolean hasUsablePickaxe() {
+        if (countXpBottles() > 0) return true;
+        for (int i = 0; i < 9; i++) {
+            ItemStack s = mc.player.getInventory().getStack(i);
+            if (s.getItem() instanceof PickaxeItem && durabilityPct(s) > toolMinDurability.get()) return true;
+        }
+        return false;
+    }
+
+    private int durabilityPct(ItemStack s) {
+        if (s.getMaxDamage() <= 0) return 100;
+        return (s.getMaxDamage() - s.getDamage()) * 100 / s.getMaxDamage();
+    }
+
+    private void info(String msg) { if (notify.get()) ChatUtils.info("AutoMine+: " + msg); }
+    private void warn(String msg) { ChatUtils.warning("AutoMine+: " + msg); }
+
+    // =========================================================
+    //  Distribute
+    // =========================================================
     private void doDistribute() {
-        if (isDistributedProperly()) { currentState = State.CHECK_FULL; return; }
+        if (isDistributedProperly()) { distSubState = 0; currentState = State.CHECK_FULL; return; }
         switch (distSubState) {
             case 0:
                 distTargetSlots.clear();
@@ -645,25 +847,20 @@ public class AutoMine extends Module {
                 distSourceSlot = -1;
                 int maxCount = 1;
 
-                // Tìm các slot rỗng (chỉ cho phép chia vào main inventory 9-35)
                 for (int i = 9; i <= 35; i++) {
-                    ItemStack st = mc.player.getInventory().getStack(i);
-                    if (st.isEmpty()) distTargetSlots.add(i);
+                    if (mc.player.getInventory().getStack(i).isEmpty()) distTargetSlots.add(i);
                 }
-
-                // Tìm nguồn item lớn nhất (có thể ở hotbar 0-8 hoặc main inventory 9-35)
                 for (int i = 0; i <= 35; i++) {
                     ItemStack st = mc.player.getInventory().getStack(i);
                     if (st.getItem() == getEffectiveCollectItem() && st.getCount() > maxCount) {
                         maxCount = st.getCount();
-                        // Handler index: 0-8 (hotbar) map to 36-44, 9-35 (main inv) map to 9-35.
                         distSourceSlot = (i < 9) ? (i + 36) : i;
                     }
                 }
-                if (distTargetSlots.isEmpty() || distSourceSlot == -1) { 
-                    distSubState = 0; 
-                    currentState = State.CHECK_FULL; 
-                    return; 
+                if (distTargetSlots.isEmpty() || distSourceSlot == -1) {
+                    distSubState = 0;
+                    currentState = State.CHECK_FULL;
+                    return;
                 }
                 distSubState = 1;
                 break;
@@ -696,7 +893,7 @@ public class AutoMine extends Module {
                     distTargetIdx = 0;
                     timer = actionDelay.get();
                 } else {
-                    distSubState = 0; // BẢO HIỂM CUỐI CÙNG: Luôn reset subState
+                    distSubState = 0;
                     currentState = State.CHECK_FULL;
                 }
                 break;
@@ -724,8 +921,7 @@ public class AutoMine extends Module {
     private boolean doStoreItemsToContainer(net.minecraft.client.gui.screen.ingame.HandledScreen<?> screen) {
         net.minecraft.screen.ScreenHandler h = screen.getScreenHandler();
         int cSz = h.slots.size() - 36;
-        
-        // Kiểm tra xem Shulker còn chỗ trống không
+
         boolean hasSpace = false;
         for (int i = 0; i < cSz; i++) {
             ItemStack st = h.getSlot(i).getStack();
@@ -737,12 +933,12 @@ public class AutoMine extends Module {
         if (!hasSpace) return false;
 
         int keep = Math.max(27, keepAmount.get());
-
         for (int i = cSz; i < h.slots.size(); i++) {
             ItemStack st = h.getSlot(i).getStack();
             if (st.getItem() == getEffectiveCollectItem()) {
-                int totalInMainInv = countTargetItems();
-                if (totalInMainInv - st.getCount() >= keep) {
+                int totalInInv = countTargetItems();
+                if (totalInInv - st.getCount() >= keep) {
+                    totalStored += st.getCount(); // thống kê
                     mc.interactionManager.clickSlot(h.syncId, i, 0, SlotActionType.QUICK_MOVE, mc.player);
                     timer = actionDelay.get();
                     return true;
@@ -758,61 +954,53 @@ public class AutoMine extends Module {
         mc.interactionManager.clickSlot(h.syncId, slot, 0, SlotActionType.PICKUP, mc.player);
     }
 
-    /**
-     * Assert a GenericContainerScreen is open.
-     * If not, goes back to `retryState` and returns false.
-     */
+    /** GUI chưa mở → retry có đếm số lần; quá nhiều → recover thay vì loop mãi. */
     private boolean assertContainerOpen(State retryState) {
         if (!(mc.currentScreen instanceof net.minecraft.client.gui.screen.ingame.HandledScreen)) {
+            if (++guiRetries > maxRetries.get() * 3) {
+                guiRetries = 0;
+                recover("mở GUI (" + retryState + ")");
+                return false;
+            }
             currentState = retryState;
-            timer = 10;
+            timer = 30;
             return false;
         }
+        guiRetries = 0;
         return true;
     }
 
     // =========================================================
-    //  Block Placement Helpers
+    //  Block Placement / Rotation Helpers
     // =========================================================
 
-    /** Place a block at position (click the block below it, UP face). */
-    private void rotateAndPlace(BlockPos pos) {
-        Vec3d target = new Vec3d(pos.getX() + 0.5, pos.getY(), pos.getZ() + 0.5);
+    private void facePos(Vec3d target) {
         double dX = target.x - mc.player.getX();
         double dY = target.y - mc.player.getEyeY();
         double dZ = target.z - mc.player.getZ();
         double diffXZ = Math.sqrt(dX * dX + dZ * dZ);
         float yaw = (float) Math.toDegrees(Math.atan2(dZ, dX)) - 90.0F;
         float pitch = (float) -Math.toDegrees(Math.atan2(dY, diffXZ));
-        
         mc.player.setYaw(yaw);
         mc.player.setPitch(pitch);
-        mc.getNetworkHandler().sendPacket(new net.minecraft.network.packet.c2s.play.PlayerMoveC2SPacket.LookAndOnGround(yaw, pitch, mc.player.isOnGround(), mc.player.horizontalCollision));
-        placeBlock(pos);
+        mc.getNetworkHandler().sendPacket(new PlayerMoveC2SPacket.LookAndOnGround(yaw, pitch, mc.player.isOnGround(), mc.player.horizontalCollision));
     }
 
-    private void placeBlock(BlockPos pos) {
-        BlockPos below  = pos.down();
-        Vec3d    hitVec = Vec3d.ofCenter(pos).subtract(0, 0.5, 0);
+    private void rotateAndPlace(BlockPos pos) {
+        facePos(new Vec3d(pos.getX() + 0.5, pos.getY(), pos.getZ() + 0.5));
+        BlockPos below = pos.down();
+        Vec3d hitVec = Vec3d.ofCenter(pos).subtract(0, 0.5, 0);
         mc.interactionManager.interactBlock(mc.player, Hand.MAIN_HAND,
             new BlockHitResult(hitVec, Direction.UP, below, false));
         mc.player.swingHand(Hand.MAIN_HAND);
     }
 
-    /** Interact (open) a block at position. */
     private void interactBlock(BlockPos pos) {
         Vec3d center = Vec3d.ofCenter(pos);
         mc.interactionManager.interactBlock(mc.player, Hand.MAIN_HAND,
             new BlockHitResult(center, Direction.UP, pos, false));
     }
 
-    /**
-     * Find a nearby position suitable for placing a block:
-     *   - block below must be solid
-     *   - position itself must be air
-     *   - block above must be air (so shulker lid can open)
-     *   - not the player's current or head position
-     */
     private BlockPos findPlacementSpot() {
         BlockPos origin = mc.player.getBlockPos();
         for (int dx = -3; dx <= 3; dx++) {
@@ -850,16 +1038,6 @@ public class AutoMine extends Module {
         return count;
     }
 
-    private int countTargetItemsInMainInv() {
-        Item item = getEffectiveCollectItem();
-        int count = 0;
-        for (int i = 9; i <= 35; i++) {
-            ItemStack s = mc.player.getInventory().getStack(i);
-            if (s.getItem() == item) count += s.getCount();
-        }
-        return count;
-    }
-
     private boolean isDistributedProperly() {
         Item target = getEffectiveCollectItem();
         for (int i = 9; i <= 35; i++) {
@@ -869,7 +1047,6 @@ public class AutoMine extends Module {
         return true;
     }
 
-    /** Main inventory (slots 9-35) are all occupied with max-stack items. */
     private boolean isMainInventoryFull() {
         for (int i = 9; i <= 35; i++) {
             ItemStack s = mc.player.getInventory().getStack(i);
@@ -878,7 +1055,6 @@ public class AutoMine extends Module {
         return true;
     }
 
-    /** Any trash item exists in main inventory (not hotbar). */
     private boolean hasTrashInMainInv() {
         for (int i = 9; i <= 35; i++) {
             ItemStack s = mc.player.getInventory().getStack(i);
@@ -887,16 +1063,10 @@ public class AutoMine extends Module {
         return false;
     }
 
-    /**
-     * Hotbar slots index 7 and 8 (user's slot 8 and 9) have unwanted items.
-     * "Unwanted" = not empty, not Ender Chest, not Shulker Box.
-     */
     private boolean hotbar78HasUnwantedItems() {
         for (int idx : new int[]{7, 8}) {
             ItemStack s = mc.player.getInventory().getStack(idx);
-            if (!s.isEmpty() && s.getItem() != Items.ENDER_CHEST && !isShulkerItem(s)) {
-                return true;
-            }
+            if (!s.isEmpty() && s.getItem() != Items.ENDER_CHEST && !isShulkerItem(s)) return true;
         }
         return false;
     }
@@ -904,9 +1074,7 @@ public class AutoMine extends Module {
     private int getExpInHotbar78() {
         for (int idx : new int[]{7, 8}) {
             ItemStack s = mc.player.getInventory().getStack(idx);
-            if (!s.isEmpty() && s.getItem() == Items.EXPERIENCE_BOTTLE) {
-                return idx;
-            }
+            if (!s.isEmpty() && s.getItem() == Items.EXPERIENCE_BOTTLE) return idx;
         }
         return -1;
     }
@@ -951,31 +1119,20 @@ public class AutoMine extends Module {
         return true;
     }
 
-
     // =========================================================
     //  Auto-detect Drop Item (Silk Touch vs Fortune)
     // =========================================================
 
-    /**
-     * Trả về item cần đếm/cất:
-     *   - auto-detect OFF → dùng collectItem setting
-     *   - auto-detect ON + có Silk Touch trong hotbar → đếm khối ore (mineBlock)
-     *   - auto-detect ON + không có Silk Touch → đếm raw drop (DIAMOND, RAW_IRON...)
-     */
     private Item getEffectiveCollectItem() {
         if (!autoDetectDrop.get()) return collectItem.get();
         return hasSilkTouchInHotbar() ? mineBlock.get() : getOreDrop(mineBlock.get());
     }
 
-    /**
-     * Kiểm tra hotbar (slot 0-8) xem có công cụ Silk Touch không.
-     */
     private boolean hasSilkTouchInHotbar() {
         if (mc.player == null || mc.world == null) return false;
         for (int i = 0; i < 9; i++) {
             ItemStack s = mc.player.getInventory().getStack(i);
             if (s.isEmpty()) continue;
-            
             Set<RegistryEntry<Enchantment>> enchants = EnchantmentHelper.getEnchantments(s).getEnchantments();
             for (RegistryEntry<Enchantment> entry : enchants) {
                 if (entry.getIdAsString().toLowerCase().contains("silk_touch")) return true;
@@ -984,10 +1141,6 @@ public class AutoMine extends Module {
         return false;
     }
 
-    /**
-     * Map: khối ore → item rơi ra khi đào bằng Fortune/tay không.
-     * Nếu không tìm thấy (custom ore server) → trả về chính khối đó.
-     */
     private static Item getOreDrop(Item oreBlock) {
         if (oreBlock == Items.DIAMOND_ORE      || oreBlock == Items.DEEPSLATE_DIAMOND_ORE)  return Items.DIAMOND;
         if (oreBlock == Items.IRON_ORE         || oreBlock == Items.DEEPSLATE_IRON_ORE)     return Items.RAW_IRON;
@@ -1000,7 +1153,7 @@ public class AutoMine extends Module {
         if (oreBlock == Items.REDSTONE_ORE     || oreBlock == Items.DEEPSLATE_REDSTONE_ORE) return Items.REDSTONE;
         if (oreBlock == Items.NETHER_QUARTZ_ORE)                                            return Items.QUARTZ;
         if (oreBlock == Items.ANCIENT_DEBRIS)                                               return Items.NETHERITE_SCRAP;
-        return oreBlock; // fallback: custom ore hoặc silk touch block
+        return oreBlock;
     }
 
     private boolean isShulkerItem(ItemStack s) {
